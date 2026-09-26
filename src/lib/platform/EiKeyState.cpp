@@ -13,9 +13,19 @@
 #include "deskflow/AppUtil.h"
 #include "platform/XDGKeyUtil.h"
 
+#include <array>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <unistd.h>
+
+#if __has_include(<linux/input.h>)
+#include <dirent.h>
+#include <fcntl.h>
+#include <linux/input.h>
+#include <sys/ioctl.h>
+#define HAVE_EVDEV_KEY_STATE
+#endif
 
 namespace deskflow {
 
@@ -84,6 +94,11 @@ void EiKeyState::init(int fd, size_t len)
 
 EiKeyState::~EiKeyState()
 {
+  for (const auto &[node, fd] : m_evdevFds) {
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
   xkb_context_unref(m_xkb);
   xkb_keymap_unref(m_xkbKeymap);
   xkb_state_unref(m_xkbState);
@@ -373,5 +388,58 @@ void EiKeyState::clearStaleModifiers()
   }
   m_xkbState = xkb_state_new(m_xkbKeymap);
   xkb_state_update_mask(m_xkbState, 0, 0, lockedMods, 0, 0, lockedLayout);
+
+  // Modifiers pressed before input capture began never reach us as EI key
+  // events, and the compositor is not required to send the depressed state
+  // on activation, so re-apply the ones that are physically held.
+  for (const auto key : heldModifierKeys()) {
+    LOG_DEBUG("modifier key %d held at capture start", key);
+    xkb_state_update_key(m_xkbState, key + 8, XKB_KEY_DOWN);
+  }
+}
+
+std::vector<std::uint32_t> EiKeyState::heldModifierKeys() const
+{
+  std::vector<std::uint32_t> keys;
+#ifdef HAVE_EVDEV_KEY_STATE
+  static constexpr std::array<std::uint32_t, 8> s_modifierKeys = {KEY_LEFTCTRL,   KEY_RIGHTCTRL, KEY_LEFTSHIFT,
+                                                                  KEY_RIGHTSHIFT, KEY_LEFTALT,   KEY_RIGHTALT,
+                                                                  KEY_LEFTMETA,   KEY_RIGHTMETA};
+  constexpr std::size_t bitsPerLong = 8 * sizeof(unsigned long);
+  std::array<unsigned long, (KEY_MAX + bitsPerLong) / bitsPerLong> held{};
+
+  // Needs read access to /dev/input (usually the input group). Without it
+  // nothing is re-applied and the state is simply cleared, as before. Only
+  // nodes not seen before are opened; the rest stay open between calls.
+  if (DIR *dir = opendir("/dev/input"); dir != nullptr) {
+    while (const dirent *entry = readdir(dir)) {
+      if (strncmp(entry->d_name, "event", 5) != 0 || m_evdevFds.count(entry->d_name) != 0) {
+        continue;
+      }
+      m_evdevFds[entry->d_name] = openat(dirfd(dir), entry->d_name, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    }
+    closedir(dir);
+  }
+
+  for (auto it = m_evdevFds.begin(); it != m_evdevFds.end();) {
+    std::array<unsigned long, held.size()> state{};
+    if (it->second >= 0 && ioctl(it->second, EVIOCGKEY(sizeof(state)), state.data()) < 0) {
+      close(it->second); // unplugged; reopened if the node comes back
+      it = m_evdevFds.erase(it);
+      continue;
+    }
+    for (std::size_t i = 0; i < held.size(); i++) {
+      held[i] |= state[i];
+    }
+    ++it;
+  }
+
+  for (const auto key : s_modifierKeys) {
+    if ((held[key / bitsPerLong] >> (key % bitsPerLong)) & 1) {
+      keys.push_back(key);
+    }
+  }
+#endif
+  return keys;
 }
 } // namespace deskflow

@@ -36,6 +36,20 @@ public:
   }
 };
 
+// Reports a fixed set of physically held modifier keys instead of reading /dev/input
+class HeldKeysEiKeyState : public deskflow::EiKeyState
+{
+public:
+  using EiKeyState::EiKeyState;
+  std::vector<std::uint32_t> m_heldKeys;
+
+protected:
+  std::vector<std::uint32_t> heldModifierKeys() const override
+  {
+    return m_heldKeys;
+  }
+};
+
 const char TestKeymap[] = R"XKB(xkb_keymap {
 xkb_keycodes "test" {
     minimum = 8;
@@ -132,6 +146,33 @@ void EiKeyStateTests::updateLockedModifiers_compositorLockState_numLockFollowsCo
   // NumLock toggled off locally
   keyState.updateLockedModifiers(0);
   QVERIFY((keyState.pollActiveModifiers() & KeyModifierNumLock) == 0);
+}
+
+void EiKeyStateTests::clearStaleModifiers_shiftHeldPhysically_shiftKept()
+{
+  // Linux keycode of left shift; xkb keycode 50 in the test keymap
+  constexpr std::uint32_t linuxLeftShift = 42;
+
+  TestAppUtil appUtil;
+  EventQueue eventQueue;
+  HeldKeysEiKeyState keyState(nullptr, &eventQueue);
+
+  QTemporaryFile keymapFile;
+  QVERIFY(keymapFile.open());
+  const QByteArray keymapData = QByteArray::fromRawData(TestKeymap, sizeof(TestKeymap) - 1);
+  QCOMPARE(keymapFile.write(keymapData), keymapData.size());
+  QVERIFY(keymapFile.flush());
+  keyState.init(keymapFile.handle(), keymapFile.size());
+
+  // Shift went down before capture began, so no EI key event was seen for it
+  keyState.m_heldKeys = {linuxLeftShift};
+  keyState.clearStaleModifiers();
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierShift) != 0);
+
+  // Released on the client side: the next clear drops it
+  keyState.m_heldKeys = {};
+  keyState.clearStaleModifiers();
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierShift) == 0);
 }
 
 QTEST_MAIN(EiKeyStateTests)

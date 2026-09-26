@@ -10,6 +10,9 @@
 #include "deskflow/KeyState.h"
 #include "platform/EiScreen.h"
 
+#include <map>
+#include <string>
+#include <vector>
 #include <xkbcommon/xkbcommon.h>
 
 struct xkb_context;
@@ -37,6 +40,16 @@ public:
   void updateXkbState(std::uint32_t keyval, bool isPressed);
   void updateLockedModifiers(xkb_mod_mask_t lockedMods);
   void clearStaleModifiers() override;
+
+protected:
+  //! Linux keycodes of the modifier keys physically held right now
+  virtual std::vector<std::uint32_t> heldModifierKeys() const;
+
+private:
+  //! /dev/input/eventN -> open fd (-1: could not open). Kept open because
+  //! opening and closing evdev nodes costs milliseconds each (~300ms for a
+  //! laptop with 27 nodes) and heldModifierKeys() runs on every screen switch.
+  mutable std::map<std::string, int> m_evdevFds;
 
 protected:
   // KeyState overrides
